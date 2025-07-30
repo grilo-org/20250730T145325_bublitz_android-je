@@ -1,0 +1,279 @@
+name: "SonarCloud Analysis"
+
+on:
+  push:
+    branches: [ "master" ]
+  workflow_dispatch: {}
+
+jobs:
+  sonar-scan:
+    name: SonarCloud Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect Project Root
+        id: find-root
+        shell: bash
+        run: |
+          LATEST_TIMESTAMP=0
+          PROJECT_DIR="."
+          PROJECT_COUNT=0
+          
+          # Find all potential project roots
+          ALL_PROJECTS=$(find . -maxdepth 3 -name "settings.gradle" -o -name "settings.gradle.kts" -o -name "pom.xml" -o -name "package.json" | head -10)
+          
+          if [ -n "$ALL_PROJECTS" ]; then
+            for project_file in $ALL_PROJECTS; do
+              PROJECT_COUNT=$((PROJECT_COUNT+1))
+              current_dir=$(dirname "$project_file")
+              
+              # Skip node_modules and other irrelevant directories
+              if [[ "$current_dir" == *"node_modules"* ]] || [[ "$current_dir" == *".git"* ]]; then
+                continue
+              fi
+              
+              timestamp=$(git log -1 --format=%ct -- "$current_dir" 2>/dev/null || echo "0")
+              if [ "$timestamp" -gt "$LATEST_TIMESTAMP" ]; then
+                LATEST_TIMESTAMP=$timestamp
+                PROJECT_DIR=$current_dir
+              fi
+            done
+          fi
+          
+          if [ "$PROJECT_COUNT" -gt 1 ]; then
+            echo "::warning::Multiple projects detected. Selected: $PROJECT_DIR"
+            echo "MULTI_PROJECT=true" >> $GITHUB_ENV
+          fi
+          
+          echo "Selected project directory: $PROJECT_DIR"
+          echo "PROJECT_PATH=$PROJECT_DIR" >> $GITHUB_ENV
+
+      # Determine Java Version with better error handling
+      - name: Determine Java Version
+        id: determine_java
+        working-directory: ${{ env.PROJECT_PATH }}
+        shell: bash
+        run: |
+          JAVA_VERSION='17'
+          
+          # Check for Gradle wrapper properties
+          if [ -f "gradle/wrapper/gradle-wrapper.properties" ]; then
+            echo "Found gradle-wrapper.properties, checking version..."
+            GRADLE_VERSION=$(grep -oP 'gradle-\K[0-9.]*(?=(-|\.))|gradle-\K[0-9.]*$' "gradle/wrapper/gradle-wrapper.properties" | head -1)
+            echo "Extracted Gradle version: [$GRADLE_VERSION]"
+            
+            if [[ "$GRADLE_VERSION" =~ ^[0-4]. ]]; then
+              echo "Old Gradle version detected. Using Java 8."
+              JAVA_VERSION='8'
+            else
+              echo "Modern Gradle version. Using Java 17."
+            fi
+          else
+            echo "No gradle-wrapper.properties found. Using Java 17 as default."
+          fi
+          
+          echo "Selected Java version: $JAVA_VERSION"
+          echo "JAVA_VERSION=$JAVA_VERSION" >> $GITHUB_OUTPUT
+
+      # Setup JDK with determined version
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          java-version: ${{ steps.determine_java.outputs.JAVA_VERSION }}
+          distribution: 'temurin'
+
+      # Prepare build.gradle for SonarQube - NOVA ABORDAGEM
+      - name: Prepare Gradle Build File
+        working-directory: ${{ env.PROJECT_PATH }}
+        shell: bash
+        run: |
+          echo "Preparing build.gradle for SonarQube analysis..."
+          
+          # Remove any existing local.properties
+          find . -name "local.properties" -type f -delete
+          
+          # Check if build.gradle exists
+          if [ -f "build.gradle" ]; then
+            echo "Found build.gradle, checking for SonarQube plugin..."
+            
+            # Check if sonarqube plugin is already present
+            if ! grep -q "org.sonarqube" build.gradle; then
+              echo "SonarQube plugin not found, adding it..."
+              
+              # Create a temporary file with the plugin at the top
+              cat > temp_build.gradle << 'EOF'
+          plugins {
+              id 'org.sonarqube' version '3.4.0.2513'
+          }
+          
+          EOF
+              
+              # Check if the original file starts with 'plugins {'
+              if head -5 build.gradle | grep -q "^plugins\s*{"; then
+                echo "Original file has plugins block, merging..."
+                # Extract existing plugins block and merge
+                awk '
+                  /^pluginss*{/ { in_plugins=1; print; next }
+                  in_plugins && /^}/ { 
+                    print "    id "org.sonarqube" version "3.4.0.2513""
+                    print $0
+                    in_plugins=0
+                    next 
+                  }
+                  in_plugins { print; next }
+                  !in_plugins { print }
+                ' build.gradle > temp_build.gradle
+              else
+                echo "No plugins block found, prepending our plugin block..."
+                cat build.gradle >> temp_build.gradle
+              fi
+              
+              # Replace the original file
+              mv temp_build.gradle build.gradle
+              echo "SonarQube plugin added successfully"
+            else
+              echo "SonarQube plugin already present"
+            fi
+          else
+            echo "No build.gradle found, creating minimal one..."
+            cat > build.gradle << 'EOF'
+          plugins {
+              id 'org.sonarqube' version '3.4.0.2513'
+          }
+          
+          repositories {
+              mavenCentral()
+              google()
+          }
+          EOF
+          fi
+          
+          # Fix Android legacy library issue if app/build.gradle exists
+          if [ -f "app/build.gradle" ]; then
+            echo "Found app/build.gradle, checking for legacy library..."
+            if ! grep -q "useLibrary.*org.apache.http.legacy" app/build.gradle; then
+              echo "Adding Apache HTTP legacy library..."
+              sed -i '/android\s*{/a\    useLibrary "org.apache.http.legacy"' app/build.gradle
+            fi
+          fi
+
+      # Build and analyze project
+      - name: Build and Analyze Project
+        working-directory: ${{ env.PROJECT_PATH }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
+          echo "SONAR_ANALYSIS_PERFORMED=false" >> $GITHUB_ENV
+          
+          # Handle Maven projects first
+          if [ -f "pom.xml" ]; then
+            echo "Maven project detected, running Maven analysis..."
+            mvn clean compile sonar:sonar \
+              -Dsonar.projectKey=grilo-org_20250730T145325_bublitz_android-je \
+              -Dsonar.organization=grilo-org \
+              -Dsonar.host.url=https://sonarcloud.io \
+              -Dsonar.login=$SONAR_TOKEN \
+              -DskipTests=true || echo "BUILD_SUCCESS=false" >> $GITHUB_ENV
+            echo "SONAR_ANALYSIS_PERFORMED=true" >> $GITHUB_ENV
+            exit 0
+          fi
+          
+          # Handle Gradle projects
+          if [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            echo "Gradle project detected, running Gradle analysis..."
+            
+            # First try: Use gradlew if available
+            if [ -f "./gradlew" ]; then
+              echo "Using gradlew..."
+              chmod +x ./gradlew
+              ./gradlew clean sonarqube \
+                -Dsonar.projectKey=grilo-org_20250730T145325_bublitz_android-je \
+                -Dsonar.organization=grilo-org \
+                -Dsonar.host.url=https://sonarcloud.io \
+                -Dsonar.login=$SONAR_TOKEN \
+                --continue --no-daemon || {
+                echo "Gradlew failed, marking for fallback..."
+                echo "BUILD_SUCCESS=false" >> $GITHUB_ENV
+              }
+            else
+              echo "No gradlew found, marking for system gradle fallback..."
+              echo "BUILD_SUCCESS=false" >> $GITHUB_ENV
+            fi
+            
+            # Check if we succeeded
+            if [ "$BUILD_SUCCESS" != "false" ]; then
+              echo "SONAR_ANALYSIS_PERFORMED=true" >> $GITHUB_ENV
+            fi
+          fi
+
+      # Gradle Setup as fallback when primary build fails
+      - name: Setup Gradle (Fallback)
+        if: env.BUILD_SUCCESS == 'false'
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '6.7.1'
+
+      # Retry with system Gradle
+      - name: Retry Build with System Gradle
+        if: env.BUILD_SUCCESS == 'false'
+        working-directory: ${{ env.PROJECT_PATH }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        shell: bash
+        run: |
+          echo "Retrying with system Gradle..."
+          
+          # Try a more basic build approach
+          gradle clean sonarqube \
+            -Dsonar.projectKey=grilo-org_20250730T145325_bublitz_android-je \
+            -Dsonar.organization=grilo-org \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.login=$SONAR_TOKEN \
+            --continue --no-daemon || {
+            echo "System gradle also failed, trying minimal approach..."
+            
+            # Last resort: just run sonarqube without build
+            gradle sonarqube \
+              -Dsonar.projectKey=grilo-org_20250730T145325_bublitz_android-je \
+              -Dsonar.organization=grilo-org \
+              -Dsonar.host.url=https://sonarcloud.io \
+              -Dsonar.login=$SONAR_TOKEN \
+              --continue --no-daemon || echo "All Gradle attempts failed"
+          }
+          
+          echo "SONAR_ANALYSIS_PERFORMED=true" >> $GITHUB_ENV
+
+
+      # Fallback SonarCloud scan if Gradle/Maven integration fails
+      - name: Fallback SonarCloud Scan
+        if: env.SONAR_ANALYSIS_PERFORMED != 'true'
+        uses: SonarSource/sonarqube-scan-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: ${{ env.PROJECT_PATH }}
+          args: >
+            -Dsonar.projectKey=grilo-org_20250730T145325_bublitz_android-je
+            -Dsonar.organization=grilo-org
+            -Dsonar.host.url=https://sonarcloud.io
+            -Dsonar.sources=.
+            -Dsonar.exclusions=**/node_modules/**,**/vendor/**,**/.git/**,**/build/**,**/dist/**,**/target/**,**/gradle/**
+
+      - name: Upload Build Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            ${{ env.PROJECT_PATH }}/**/*.log
+            ${{ env.PROJECT_PATH }}/build/reports/**
+          if-no-files-found: ignore
